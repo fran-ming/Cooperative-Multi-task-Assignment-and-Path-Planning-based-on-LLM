@@ -1,28 +1,3 @@
-"""
-prompts.py -- semantic-enriched version
-
-Design change vs the original version:
-  1. The chromosome is never shown to the LLM as a bare list [v1,...,vN] alone.
-     Every gene is inlined into a task-centric row that also carries the
-     task's constraints AND the decoder's evaluation of that gene, so the
-     LLM never has to do position-counting / cross-table joins to figure out
-     what a gene means or whether it is doing well.
-  2. Feasibility is computed by the program (mirroring the mask M_ik used in
-     the EAAI/HGAP pipeline) and handed to the LLM as an explicit candidate
-     set per task, instead of making the LLM re-derive feasibility from raw
-     numbers.
-  3. Constraint violations are aggregated across the population into a
-     "tension summary" so the LLM can prioritize which relations to fix,
-     instead of reading N separate per-individual feedback blocks.
-  4. Crossover/mutation no longer ask the LLM to reproduce the whole
-     chromosome. They ask for a small list of edits {task_id, new_ot,
-     reason}. The program applies edits deterministically onto a copy of
-     the parent chromosome (apply_edits). This removes the "LLM mis-copies
-     an unrelated gene while rewriting the array" failure mode entirely,
-     and makes "task order / gene count / OT set unchanged" a property the
-     program guarantees rather than a rule the LLM must remember to obey.
-"""
-
 import json
 import re
 
@@ -31,116 +6,38 @@ import re
 # 1. Core system prompts
 # ---------------------------------------------------------------------------
 
-PROBLEM_DEFINITION = """You are an evolutionary optimization agent for cooperative object-target scheduling in closed-track automated driving testing.
+PROBLEM_DEFINITION = """You are an evolutionary optimization agent for cooperative object-target scheduling in closed-track automated driving tests.
 
-The task sequence is FIXED and MUST NOT be changed.
+The task order is FIXED. Never change task order, create/remove tasks, create new OTs, change task attributes, or change objective definitions.
 
-Chromosome representation:
-chi = [v1, v2, ..., vN]
-where vi denotes the OT assigned to task Ti.
+Chromosome: chi=[v1,...,vN]; vi is the OT assigned to task Ti. Inputs are task-centric rows: task id, time window, duration, sync group, assigned OT, decoder arrival/status/lateness, and FEASIBLE CANDIDATES. Read each task from its own row, not from array positions.
 
-You will never be shown this raw array by itself. Instead, every task will
-be shown together with its own constraints, its currently assigned OT, and
-(when available) the decoder's evaluation of that assignment, plus the set
-of OTs that are actually feasible for that task. Read assignments from
-these per-task rows, not by counting array positions.
+Optimize in this priority order:
+1. Jd = failed task units (minimize first)
+2. Jm = global makespan
+3. Jb = OT workload imbalance
+4. Jt = total travel distance
 
-Your responsibility is to improve OT assignment patterns.
+Only propose edits as {"task_id":..., "new_ot":...}. The new OT MUST be in that task's FEASIBLE CANDIDATES. Never rewrite the whole chromosome. The external deterministic decoder confirms feasibility and objectives.
 
-The four optimization objectives are:
-1. Jd: minimize the number of failed task units.
-2. Jm: minimize global makespan.
-3. Jb: minimize OT workload imbalance.
-4. Jt: minimize total travel distance.
-
-The schedule is subject to VUT-triggered execution time-window constraints,
-cooperative synchronization constraints, OT availability and sequential
-execution constraints, and road topology and road-resource constraints.
-These constraints are what determine the FEASIBLE CANDIDATES list given to
-you for each task -- a candidate OT that is not in that list is guaranteed
-infeasible for that task and must never be proposed.
-
-Objective values and physical feasibility are ultimately confirmed by an
-external deterministic decoder and evaluator; the feasible-candidate lists
-you receive are a fast pre-filter, not a substitute for that evaluation.
-
-You MUST NOT:
-- change task order;
-- create or remove tasks;
-- create new OTs;
-- change task attributes;
-- change objective definitions;
-- propose an OT for a task that is not in that task's feasible-candidate list;
-- directly claim a candidate is feasible without decoder evaluation.
-
-You operate only by proposing EDITS (task_id -> new OT), never by rewriting
-the whole chromosome. Unedited genes are left untouched by the program."""
+Return JSON only."""
 
 
-SELECTION_SYSTEM = """You are performing parent selection for an LLM-guided multi-objective evolutionary algorithm.
+SELECTION_SYSTEM = """Perform parent selection for an LLM-guided multi-objective evolutionary algorithm.
 
-The task order is fixed. Select individuals that provide a good combination of:
-1. Pareto quality;
-2. objective performance;
-3. population diversity;
-4. different OT assignment patterns, especially different resolutions of the
-   constraint tensions listed in the CONSTRAINT TENSION SUMMARY;
-5. successful execution under testing constraints.
+Select a diverse parent set that balances low Pareto rank, better objective values, successful decoding, and different constraint-tension hotspots. Prefer distinct OT assignment patterns so crossover has complementary material. Do not recompute objectives.
 
-Do not select all individuals from one similar assignment pattern. Individuals
-with lower Pareto rank are generally preferred. For individuals on the same
-Pareto front, crowding distance should be considered to preserve diversity,
-and prefer individuals that resolve DIFFERENT tension hotspots so the next
-generation's crossover has genuinely complementary material to combine.
-
-Do not recompute objective values. Return only the selected individual IDs."""
+Return only JSON with selected individual IDs."""
 
 
-CROSSOVER_SYSTEM = """You are performing crossover for cooperative OT scheduling.
+CROSSOVER_MUTATION_SYSTEM = """Perform crossover followed by mutation for cooperative OT scheduling.
 
-The task sequence is fixed: T1 -> T2 -> ... -> TN.
+Task order is FIXED. For each parent pair:
+1. For every differing task, choose the better parent's OT or another FEASIBLE CANDIDATE.
+2. Keep tasks in the same sync group assigned consistently.
+3. If MUTATE=1, apply 1-3 targeted edits to the resulting child, prioritizing FAIL/late tasks and choosing only FEASIBLE CANDIDATES.
 
-You will be shown two parents ONLY at the rows where their assignments
-differ (rows where both parents agree are omitted -- there is nothing to
-recombine there). For each differing task, you will see both parents'
-choice of OT, each task's constraints, each candidate's feasibility, and
-(when available) how each parent's choice performed under the decoder.
-
-Produce an offspring by selecting, for each differing task, whichever
-parent's choice looks better given the task's constraints and decoder
-feedback -- or propose a third feasible candidate if neither parent's
-choice is good. Consider synchronization groups as a UNIT: if a task
-belongs to a sync group, prefer keeping that group's OT choices consistent
-with each other rather than picking parents independently per task inside
-the same group.
-
-Return ONLY a list of edits relative to Parent A. Do not include tasks
-where you keep Parent A's assignment. Each edit must use an OT id that is
-in the target task's feasible-candidate list.
-
-Do not calculate objective values yourself. The external decoder will
-evaluate the offspring. Return only JSON."""
-
-
-MUTATION_SYSTEM = """You are performing mutation for cooperative OT scheduling.
-
-The task order is fixed. You will be shown the current individual as a
-task-centric view: each task's constraints, its currently assigned OT, the
-decoder's evaluation of that assignment (arrival time, success/fail,
-lateness), and the feasible-candidate list for that task. You will also be
-shown a CONSTRAINT TENSION SUMMARY describing which relations (sync groups,
-OT resource conflicts, workload imbalance) are currently under the most
-stress across the population.
-
-Propose a small number of targeted edits that address specific, named
-tensions -- e.g. "T5 is late by 2.3 under its sync group's tolerance;
-reassigning it to OT7 (feasible, currently under-loaded) should reduce
-that error." Prefer edits that fix an identified problem over edits with
-no stated reason. Each edit's new OT must be in that task's
-feasible-candidate list.
-
-Do not change task order. Do not create new tasks. Do not create new OTs.
-Do not change task attributes. Return only JSON."""
+Output every final child chromosome as JSON, in the same pair order, without recalculating objectives."""
 
 
 # ---------------------------------------------------------------------------
@@ -366,6 +263,42 @@ def selection_user(population, num_parents, include_task_info=False, **kwargs):
     )
 
 
+def crossover_mutation_batch_user(parent_pairs, scenario, mutation_flags=None, include_task_info=False, **kwargs):
+    """One user prompt for the combined crossover+mutation operator.
+
+    The model receives all parent pairs plus a per-pair MUTATE flag. It
+    returns the final child chromosome for every pair, so crossover and
+    mutation are performed in a single API call rather than two separate
+    calls.
+    """
+    _ = include_task_info
+    flags = mutation_flags or [False] * len(parent_pairs)
+    lines = [
+        "CROSSOVER + MUTATION BATCH",
+        "",
+        "Produce one final child chromosome for each of the %d pairs below." % len(parent_pairs),
+        "",
+    ]
+    for i, (pa, pb) in enumerate(parent_pairs, 1):
+        mutate = 1 if bool(flags[i - 1]) else 0
+        lines.append(
+            "Pair %03d | MUTATE=%d | A objectives %s | B objectives %s" % (
+                i, mutate, _format_objectives(pa), _format_objectives(pb),
+            )
+        )
+        lines.append(build_diff_view(
+            scenario, pa.chromosome, pb.chromosome,
+            decode_result_a=pa.decode_result, decode_result_b=pb.decode_result,
+        ))
+        lines.append("")
+    lines.append(
+        'Return:\n{\n  "offspring": [\n'
+        '      {"individual_id": "001", "chromosome": [1, 2, ...]},\n'
+        '      ...\n  ]\n}'
+    )
+    return "\n".join(lines)
+
+
 def crossover_user(parent_a, parent_b, scenario, include_task_info=False, **kwargs):
     diff_view = build_diff_view(
         scenario, parent_a.chromosome, parent_b.chromosome,
@@ -495,6 +428,26 @@ def extract_batch_offspring(payload):
         return None
     value = payload.get("offspring")
     return value if isinstance(value, list) else None
+
+
+def extract_batch_chromosomes(payload):
+    """Normalize combined crossover+mutation output to a list of chromosomes.
+
+    Accepts both raw chromosome lists and {"chromosome": [...]} objects.
+    Invalid entries become None so callers can use their safe fallback.
+    """
+    value = extract_batch_offspring(payload)
+    if not value:
+        return None
+    result = []
+    for item in value:
+        if isinstance(item, (list, tuple)):
+            result.append([int(v) for v in item])
+        elif isinstance(item, dict) and isinstance(item.get("chromosome"), (list, tuple)):
+            result.append([int(v) for v in item["chromosome"]])
+        else:
+            result.append(None)
+    return result
 
 
 def extract_batch_mutations(payload):

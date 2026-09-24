@@ -1,11 +1,20 @@
 # -*- coding: utf-8 -*-
-"""LLM-NSGA 10-task CMAPP path-planning visualization.
+"""MPaGE-CMAPP path-planning visualization (meta-heuristic evolution).
+
+MPaGE (Meta-heuristic Programming with Adaptive Genetic Evolution) evolves
+search *heuristics* (not solutions) using the existing NSGA-II / Decoder /
+ObjectiveEvaluator stack as its ground-truth feasibility evaluator (project
+guide sections 2 and 37).  Each heuristic seeds the inner NSGA-II, which then
+searches the solution space; heuristic-level objectives (hypervolume,
+feasible-rate, runtime) drive Pareto-grid selection and semantic clustering.
 
 Outputs:
-- results/figures/pathplanner/llm_nsga_route_10task.png
-- results/figures/pathplanner/llm_nsga_gantt_10task.png
-- results/figures/pathplanner/llm_nsga_simulation.gif
-- results/figures/pathplanner/llm_nsga_schedule_10task.csv
+- results/figures/pathplanner/mpage_route_10task.png
+- results/figures/pathplanner/mpage_gantt_10task.png
+- results/figures/pathplanner/mpage_simulation.gif
+- results/figures/pathplanner/mpage_schedule_10task.csv
+Appends one row (algorithm="MPaGE-CMAPP") to:
+- results/figures/pathplanner/llm_nsga_comparison_single_run_14.csv
 """
 import io
 import os
@@ -14,13 +23,9 @@ import math
 from pathlib import Path
 
 import matplotlib
+matplotlib.use("Agg")  # headless-safe: figures are saved, never popped up
 import matplotlib.animation as animation
-# Use the default interactive backend so figures can be shown to the user
-# before saving. If running in a headless environment, users can set the
-# backend externally or the environment will fall back to a non-interactive
-# backend and `plt.show()` may be a no-op.
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
 from PIL import Image
 import pandas as pd
 import time
@@ -28,40 +33,52 @@ import time
 ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 
-from data.config import EXPERIMENT_CONFIG, RESULTS_DIR, SERVICE_VEH_SPEED_MPS
+from data.config import RESULTS_DIR
 from nsga.decoder import build_standard_scenario, build_cooperative_scenario
-from algorithms.llm_nsga import LLMNSGA2Solver
-from llm.client import LLMClient
+from MPAGE.solver import MPAGESolver
+from MPAGE.config import MPAGE_CONFIG
 
 SAVE_DIR = RESULTS_DIR / "figures" / "pathplanner"
 
+# MPaGE meta-level configuration.  LLM is disabled by default so the experiment
+# runs deterministically without an API dependency (guide section 43); set the
+# environment variable MPAGE_ENABLE_LLM=1 to enable LLM-driven heuristic
+# reflection / mutation / crossover.
+EXPERIMENT_MPAGE_CONFIG = dict(MPAGE_CONFIG)
+EXPERIMENT_MPAGE_CONFIG.update({
+    "enable_llm": os.getenv("MPAGE_ENABLE_LLM", "0") == "1",
+    "heuristic_population_size": 6,
+    "meta_generations": 6,
+    "inner_generations": 10,
+    "inner_population_size": 40,
+    "elite_heuristics": 4,
+    "grid_bins": 5,
+    "semantic_clusters": 3,
+    "mutation_probability": 0.8,
+    "crossover_probability": 0.7,
+    "heuristic_seed_ratio": 0.3,
+    "seed": 42,
+})
 
-def run_llm_nsga(scenario, seed=42, debug_print_llm=False):
-    # Create a client and enable debug printing if requested so every request
-    # sent to the LLM and every response received will be printed to console.
-    client = LLMClient()
-    if debug_print_llm:
-        client.debug_print = True
 
-    solver = LLMNSGA2Solver(
-        population_size=EXPERIMENT_CONFIG["population_size"],
-        generations=EXPERIMENT_CONFIG["generations"],
-        crossover_rate=0.9,
-        mutation_rate=0.6,
-        seed=seed,
-        client=client,
-    )
-    best, history = solver.solve(scenario)
-    return best, history, solver.get_stats(), client.model_name
+def run_mpage(scenario, seed=42):
+    """Run the MPaGE meta-level solver and return its best CMAPP solution."""
+    solver = MPAGESolver(config=EXPERIMENT_MPAGE_CONFIG, seed=seed)
+    result = solver.solve(scenario)
+    best = result["best_solution"]
+    history = result["history"]
+    stats = solver.get_stats()
+    model_name = ("MPaGE-CMAPP" if not EXPERIMENT_MPAGE_CONFIG["enable_llm"]
+                  else "MPaGE-CMAPP (LLM)")
+    return best, history, stats, model_name
 
 
 def _line_points(scenario, source, target, max_nodes=120):
     path = scenario.oracle.shortest_path(source, target)
     if not path:
         path = [source, target]
-    return [(scenario.graph.node_position(n)[0], scenario.graph.node_position(n)[1]) for n in path[:max_nodes]]
-
-
+    return [(scenario.graph.node_position(n)[0], scenario.graph.node_position(n)[1])
+            for n in path[:max_nodes]]
 def plot_routes_on_map(scenario, best, output_dir):
     fig, ax = plt.subplots(figsize=(14, 12))
     for u, neighbors in scenario.graph.adj.items():
@@ -81,7 +98,6 @@ def plot_routes_on_map(scenario, best, output_dir):
     colors = plt.cm.tab10.colors
     for ot in scenario.ots:
         color = colors[(ot.ot_id - 1) % len(colors)]
-        # depot marker
         x, y = scenario.graph.node_position(ot.initial_position)
         ax.scatter([x], [y], marker="s", s=100, color=color, edgecolors="black", linewidths=0.7, zorder=4)
         ax.annotate("OT%d" % ot.ot_id, (x, y), textcoords="offset points", xytext=(5, 5), fontsize=8)
@@ -104,7 +120,6 @@ def plot_routes_on_map(scenario, best, output_dir):
             ax.annotate(rec.task_id, (x, y), textcoords="offset points", xytext=(4, -8), fontsize=7)
             current = rec.terminal
 
-    # Plot VUT route (if provided) as a purple line
     try:
         key_nodes = getattr(scenario, "vut_key_nodes", None) or []
         if key_nodes:
@@ -116,16 +131,10 @@ def plot_routes_on_map(scenario, best, output_dir):
                 ax.legend()
     except Exception:
         pass
-    ax.set_title("LLM-NSGA CMAPP Route Plan", fontsize=14)
+    ax.set_title("MPaGE-CMAPP Route Plan", fontsize=14)
     ax.set_aspect("equal", adjustable="datalim")
     ax.grid(alpha=0.15)
-    # Display the figure to the user first, then save after the window is
-    # closed (or immediately if running non-interactively).
-    try:
-        plt.show()
-    except Exception:
-        pass
-    path = output_dir / "llm_nsga_route_10task.png"
+    path = output_dir / "mpage_route_10task.png"
     fig.savefig(path, dpi=1000, bbox_inches="tight")
     plt.close(fig)
     print("Saved route map: %s" % path)
@@ -148,13 +157,9 @@ def plot_gantt(scenario, best, output_dir):
     ax.set_yticklabels(["OT%d" % ot.ot_id for ot in scenario.ots])
     ax.set_xlabel("Time")
     ax.set_ylabel("Object target")
-    ax.set_title("LLM-NSGA CMAPP Gantt Chart")
+    ax.set_title("MPaGE-CMAPP Gantt Chart")
     ax.grid(axis="x", alpha=0.2)
-    try:
-        plt.show()
-    except Exception:
-        pass
-    path = output_dir / "llm_nsga_gantt_10task.png"
+    path = output_dir / "mpage_gantt_10task.png"
     fig.savefig(path, dpi=1000, bbox_inches="tight")
     plt.close(fig)
     print("Saved Gantt chart: %s" % path)
@@ -189,7 +194,7 @@ def build_leg_timeline(scenario, best):
             t0 = rec.arrival
             for u, v in zip(exec_path, exec_path[1:]):
                 d = scenario.graph.edge_length.get((u, v), scenario.graph.euclidean_length(u, v))
-                dt = d / ot.speed if rec.finish - rec.arrival < 1e-9 else (d / ot.speed)
+                dt = d / ot.speed
                 segments.append((scenario.graph.node_position(u)[0], scenario.graph.node_position(u)[1],
                                  scenario.graph.node_position(v)[0], scenario.graph.node_position(v)[1],
                                  t0, min(rec.finish, t0 + dt)))
@@ -241,8 +246,6 @@ def _pos_along_path_nodes(graph, path_nodes, fraction):
         walked += length
     u, v, _ = segments[-1]
     return graph.node_position(v)
-
-
 def make_animation(scenario, best, output_dir, frames=30):
     timelines = build_leg_timeline(scenario, best)
     max_t = max((best.metrics.get("C_max", 1.0) or 1.0), 1.0)
@@ -292,10 +295,11 @@ def make_animation(scenario, best, output_dir, frames=30):
             ax.scatter([pos[0]], [pos[1]], s=110, color=colors[(ot.ot_id - 1) % len(colors)],
                        edgecolors="black", linewidths=0.6, zorder=5)
 
-        ax.set_title("LLM-NSGA simulation  t=%.1fs" % t)
+        ax.set_title("MPaGE-CMAPP simulation  t=%.1fs" % t)
         ax.set_aspect("equal", adjustable="datalim")
         ax.grid(alpha=0.15)
-        ax.legend(loc="upper right") if vut_path_nodes and len(vut_path_nodes) >= 2 else None
+        if vut_path_nodes and len(vut_path_nodes) >= 2:
+            ax.legend(loc="upper right")
         return []
 
     display_fig, display_ax = plt.subplots(figsize=(9, 8))
@@ -308,19 +312,13 @@ def make_animation(scenario, best, output_dir, frames=30):
         repeat=True,
     )
 
-    # Show the real animated figure first so the user can zoom/pan it like a PNG plot.
-    try:
-        plt.show()
-    except Exception:
-        pass
-
-    # After the interactive preview is shown, save the final GIF on disk.
-    gif_path = output_dir / "llm_nsga_simulation.gif"
+    # Headless-safe: no plt.show(), the GIF is saved straight to disk.
+    gif_path = output_dir / "mpage_simulation.gif"
     try:
         animation_obj.save(gif_path, writer="pillow", fps=max(1, round(1000 / 120)))
     except Exception:
-        # Fallback: save a GIF from the static frame sequence for environments without
-        # an interactive display backend.
+        # Fallback: save a GIF from the static frame sequence for environments
+        # without a functional animation writer.
         images = []
         for frame_idx in range(frames):
             fig, ax = plt.subplots(figsize=(9, 8))
@@ -333,8 +331,6 @@ def make_animation(scenario, best, output_dir, frames=30):
         if images:
             images[0].save(gif_path, save_all=True, append_images=images[1:], duration=120, loop=0)
     print("Saved simulation GIF: %s" % gif_path)
-
-
 def write_schedule_csv(scenario, best, output_dir):
     rows = []
     for rec in best.decode_result.records:
@@ -355,42 +351,38 @@ def write_schedule_csv(scenario, best, output_dir):
             "lateness": round(rec.lateness, 4),
             "travel_distance": round(rec.total_travel, 4),
         })
-    path = output_dir / "llm_nsga_schedule_10task.csv"
+    path = output_dir / "mpage_schedule_10task.csv"
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
     print("Saved schedule CSV: %s" % path)
-
-
 def main():
     output_dir = SAVE_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
-    # Use decoder's predefined task/OT positions and VUT key nodes.
-    # Set `use_cooperative` to True to build a cooperative scenario.
-    use_cooperative = True
-    #修改任务参数
-    if use_cooperative:
-        print("Building 14-task cooperative CMAPP scenario from decoder defaults...")
-        scenario = build_cooperative_scenario(num_tasks=15, seed=42)
-    else:
-        print("Building 10-task CMAPP scenario from decoder defaults...")
-        scenario = build_standard_scenario(num_tasks=10, seed=42)
-    print("Running LLM-NSGA...")
+    # Use decoder's predefined task/OT positions and VUT key nodes.  The
+    # cooperative scenario groups task units by semantic type so every unit in
+    # one sync group shares a single non-overlapping time window (guide section
+    # 2).  Kept at 14 tasks to stay consistent with the OR-Tools/LLM-NSGA
+    # comparison rows already recorded in *_single_run_14.csv.
+    #修改协作参数
+    print("Building 14-task cooperative CMAPP scenario from decoder defaults...")
+    scenario = build_cooperative_scenario(num_tasks=14, seed=42)
+    print("Running MPaGE-CMAPP...")
     start = time.time()
-    best, history, stats, model_name = run_llm_nsga(scenario, seed=42)
+    best, history, stats, model_name = run_mpage(scenario, seed=42)
     runtime = time.time() - start
-    print("LLM-NSGA objectives [Jd,Jm,Jb,Jt]:", best.objectives)
-    print("LLM stats:", stats)
+    print("MPaGE-CMAPP objectives [Jd,Jm,Jb,Jt]:", best.objectives)
+    print("MPaGE-CMAPP stats:", stats)
     plot_routes_on_map(scenario, best, output_dir)
     plot_gantt(scenario, best, output_dir)
     write_schedule_csv(scenario, best, output_dir)
     make_animation(scenario, best, output_dir, frames=30)
-    # Write a single-run results CSV with the same columns as the multi-seed
-    # reference file.
+    # Append a single-run results row using the same columns as the LLM/OR
+    # reference files.
     try:
         num_tasks = len(scenario.tasks)
         metrics = best.metrics
         row = {
             "seed": 15,
-            "algorithm": "LLM-NSGA",
+            "algorithm": "MPaGE-CMAPP",
             "num_tasks": num_tasks,
             "runtime": runtime,
             "fitness_J": metrics.get("fitness_J", 0),
@@ -426,7 +418,7 @@ def main():
                 existing["model-name"] = ""
             combined = pd.concat([
                 existing[cols] if set(cols).issubset(existing.columns) else existing.reindex(columns=cols, fill_value=""),
-                pd.DataFrame([row], columns=cols)
+                pd.DataFrame([row], columns=cols),
             ], ignore_index=True)
             combined.to_csv(results_path, index=False, encoding="utf-8-sig")
         else:

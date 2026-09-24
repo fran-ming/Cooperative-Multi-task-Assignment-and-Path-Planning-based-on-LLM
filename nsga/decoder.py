@@ -332,19 +332,23 @@ class Decoder:
                 continue
 
             # Road-resource feasibility: no two OTs may occupy the same staging
-            # point during overlapping intervals.
-            conflict = False
-            for occ_start, occ_finish, occ_ot, occ_task in resource_occupancy[task.staging]:
-                if rec.ot_id == occ_ot:
+            # point during overlapping intervals. Cooperative tasks (those that
+            # belong to a sync group) are exempt from this staging conflict
+            # check, matching OR-Tools semantics where AddNoOverlap is only
+            # applied to non-cooperative tasks (plot_pathplanning_OR.py).
+            if task.sync_group is None:
+                conflict = False
+                for occ_start, occ_finish, occ_ot, occ_task in resource_occupancy[task.staging]:
+                    if rec.ot_id == occ_ot:
+                        continue
+                    if rec.arrival < occ_finish + 1e-9 and occ_start < rec.finish + 1e-9:
+                        conflict = True
+                        break
+                if conflict:
+                    rec.success = False
+                    rec.fail_reason = "road_resource"
+                    result.records.append(rec)
                     continue
-                if rec.arrival < occ_finish + 1e-9 and occ_start < rec.finish + 1e-9:
-                    conflict = True
-                    break
-            if conflict:
-                rec.success = False
-                rec.fail_reason = "road_resource"
-                result.records.append(rec)
-                continue
 
             rec.success = True
             resource_occupancy[task.staging].append((rec.arrival, rec.finish, rec.ot_id, task.index))
@@ -373,7 +377,7 @@ DEFAULT_OT_POSITIONS = [
     "18.0.1.-1",
     "204.0.1.-1",
     "204.0.2.-1",
-    "477.0.1.-1",
+    #"477.0.1.-1",
 ]
 
 DEFAULT_VUT_KEY_NODES = [
@@ -401,16 +405,16 @@ DEFAULT_TASK_TEMPLATES = [
     ("E4", "merge", "37.0.-1.-1", "91.0.-1.-1", 16.0, "37.0.-2.-1"),
     ("E5", "merge", "37.0.-1.-1", "91.0.-2.-1", 16.0, "37.0.-2.-1"),
     ("E6", "merge", "37.0.-3.-1", "91.0.-2.-1", 16.0, "37.0.-2.-1"),
-    #("E7", "merge", "37.0.-3.-1", "91.0.-1.-1", 16.0, "37.0.-2.-1"),
-    ("E8", "braking", "425.0.-1.-1", "202.0.-1.-1", 7.0, "50.0.-1.-1"),
+    ("E7", "merge", "37.0.-3.-1", "91.0.-1.-1", 16.0, "37.0.-2.-1"),
+    #("E8", "braking", "425.0.-1.-1", "202.0.-1.-1", 7.0, "50.0.-1.-1"),
     ("E9", "crossing", "204.0.2.-1", "63.0.2.-1", 10.0, "202.0.-1.-1"),
     ("E10", "crossing", "204.0.1.-1", "63.0.1.-1", 10.0, "202.0.-1.-1"),
     ("E11", "occlusion", "18.0.2.-1", "308.0.1.-1", 7.0, "18.0.1.-1"),
-    ("E12", "changing", "479.0.1.-1", "23.0.1.-1", 10.0, "477.0.1.-1"),
+    ("E12", "changing", "479.0.1.-1", "23.0.1.-1", 8.0, "477.0.1.-1"),
     ("E13", "turning", "30.0.1.-1", "159.0.2.-1", 9.0, "30.0.2.-1"),
     ("E14", "following", "5.0.1.-1", "351.0.1.-1", 15.0, "7.0.-1.-1"),
     ("E15", "following", "5.0.1.-1", "355.0.-1.-1", 15.0, "7.0.-1.-1"),
-    ("E16", "following", "5.0.1.-1", "344.0.1.-1", 15.0, "7.0.-1.-1"),
+    #("E16", "following", "5.0.1.-1", "344.0.1.-1", 15.0, "7.0.-1.-1"),
 ]
 
 
@@ -466,12 +470,33 @@ def _make_scenario(num_tasks, seed, cooperative=False, cluster_size=None):
     # type (e.g., all 'crossing' together, all 'merge' together). For each
     # semantic we pick the first encountered trigger as the group's trigger.
     semantic_group_trigger = {}
+    semantic_group_duration = {}
+    semantic_group_order = []
+    semantic_group_window = {}
     if cooperative:
         for tpl in selected:
             sem = tpl[1]
             trig = tpl[5]
+            dur = tpl[4]
             if sem not in semantic_group_trigger:
                 semantic_group_trigger[sem] = trig
+                semantic_group_duration[sem] = dur
+                semantic_group_order.append(sem)
+            else:
+                semantic_group_duration[sem] = max(semantic_group_duration[sem], dur)
+
+        # Build group-level windows in VUT-arrival order. Every task in the
+        # same sync group shares one [a, b]. Different groups are laid out
+        # back-to-back, so their time windows do not overlap.
+        next_start = 0.0
+        for sem in semantic_group_order:
+            hit = arrivals.get(semantic_group_trigger.get(sem), 0.0)
+            raw_start = max(0.0, hit - TW_PRE_SLACK)
+            group_duration = semantic_group_duration[sem]
+            start = max(raw_start, next_start)
+            end = start + group_duration + TW_POST_SLACK
+            semantic_group_window[sem] = (start, end)
+            next_start = end
     for i, (event_id, semantic, staging, terminal, duration, trigger) in enumerate(selected):
         tw = (0.0, 1000.0)
         # Non-cooperative: use per-task trigger/window (with optional staggering)
@@ -489,17 +514,14 @@ def _make_scenario(num_tasks, seed, cooperative=False, cluster_size=None):
                     hit + stagger + duration + 0,
                 )
         else:
-            # Cooperative: group by semantic type. All units with the same
-            # `semantic` share the same triggering event/window.
-            group_trigger = semantic_group_trigger.get(semantic, trigger)
-            if group_trigger in arrivals:
-                hit = arrivals[group_trigger]
-                tw = (max(0.0, hit - TW_PRE_SLACK), hit + duration + TW_POST_SLACK)
+            # Cooperative: every unit in one sync group uses the same
+            # non-overlapping group window computed above.
+            tw = semantic_group_window.get(semantic, (0.0, 1000.0))
 
         # Synchronization group identifier: use the semantic type for grouping
         sync_group = semantic if cooperative else None
         # For cooperative tasks, use the group's trigger as the VUT trigger
-        vut_trigger = group_trigger if cooperative else trigger
+        vut_trigger = semantic_group_trigger.get(semantic, trigger) if cooperative else trigger
         # For cooperative tasks, assign an event id that reflects the semantic
         event_id_use = event_id if not cooperative else ("EC_" + semantic)
 
@@ -535,7 +557,7 @@ def build_standard_scenario(num_tasks=10, seed=0):
     return _make_scenario(num_tasks, seed, cooperative=False)
 
 
-def build_cooperative_scenario(num_tasks=12, cluster_size=3, seed=0):
+def build_cooperative_scenario(num_tasks=16, cluster_size=3, seed=0):
     return _make_scenario(num_tasks, seed, cooperative=True, cluster_size=cluster_size)
 
 

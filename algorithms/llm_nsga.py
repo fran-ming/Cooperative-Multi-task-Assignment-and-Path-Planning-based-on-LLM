@@ -3,10 +3,8 @@ import random
 from data.config import LLM_CONFIG
 from nsga.decoder import Decoder, ObjectiveEvaluator
 from nsga.encoding import (
-    Individual,
     initialize_population,
     validate_chromosome,
-    repair_chromosome,
     uniform_crossover,
     bitwise_mutation,
 )
@@ -21,15 +19,12 @@ from nsga.nsgaii import (
 from llm.client import LLMClient
 from llm.prompts import (
     SELECTION_SYSTEM,
-    CROSSOVER_SYSTEM,
-    MUTATION_SYSTEM,
+    CROSSOVER_MUTATION_SYSTEM,
     selection_user,
-    crossover_batch_user,
-    mutation_batch_user,
+    crossover_mutation_batch_user,
     parse_json_response,
     extract_selected_ids,
-    extract_batch_offspring,
-    extract_batch_mutations,
+    extract_batch_chromosomes,
 )
 
 
@@ -88,18 +83,36 @@ class LLMOperator:
             pass
         return [tournament_select(population, self.rng) for _ in range(num_parents)]
 
-    def crossover_batch(self, parent_pairs):
+    def crossover_mutation_batch(self, parent_pairs, mutation_flags=None):
+        """Apply crossover and mutation to parent pairs in a single LLM call."""
         if not parent_pairs:
             return []
-        batch_size = min(self.batch_size, len(parent_pairs))
+        flags = mutation_flags or [False] * len(parent_pairs)
         result_chromosomes = []
+
+        # The combined prompt is intentionally sent as one batch. For small
+        # verification runs this is exactly one API call; larger populations are
+        # still chunked to keep the output tractable for the model.
+        # Keep the verification-size population in one combined call so the
+        # crossover+mutation phase really runs once per generation. Large
+        # populations are still chunked to keep LLM output sizes tractable.
+        batch_size = len(parent_pairs) if len(parent_pairs) <= 20 else min(self.batch_size, len(parent_pairs))
         for start in range(0, len(parent_pairs), batch_size):
             pairs = parent_pairs[start:start + batch_size]
-            fallback = [uniform_crossover(a.chromosome, b.chromosome, self.rng) for a, b in pairs]
-            include_task_info = not getattr(self.client, "_initialized", False)
-            response = self._generate(CROSSOVER_SYSTEM, crossover_batch_user(pairs, self.scenario, include_task_info=include_task_info))
+            pair_flags = flags[start:start + batch_size]
+            fallback = []
+            for (a, b), mutate in zip(pairs, pair_flags):
+                child = uniform_crossover(a.chromosome, b.chromosome, self.rng)
+                if mutate:
+                    child = bitwise_mutation(child, self.scenario.valid_ot_ids, self.rng)
+                fallback.append(child)
+
+            response = self._generate(
+                CROSSOVER_MUTATION_SYSTEM,
+                crossover_mutation_batch_user(pairs, self.scenario, mutation_flags=pair_flags),
+            )
             payload = parse_json_response(response) if response else None
-            offspring = extract_batch_offspring(payload) if payload else None
+            offspring = extract_batch_chromosomes(payload) if payload else None
             if not offspring:
                 result_chromosomes.extend(fallback)
                 continue
@@ -110,31 +123,6 @@ class LLMOperator:
                 else:
                     result_chromosomes.append(fallback[i])
         return result_chromosomes
-
-    def mutation_batch(self, individuals):
-        if not individuals:
-            return []
-        batch_size = min(self.batch_size, len(individuals))
-        result_chromosomes = []
-        for start in range(0, len(individuals), batch_size):
-            batch = individuals[start:start + batch_size]
-            fallback = [bitwise_mutation(ind.chromosome, self.scenario.valid_ot_ids, self.rng) for ind in batch]
-            include_task_info = not getattr(self.client, "_initialized", False)
-            response = self._generate(MUTATION_SYSTEM, mutation_batch_user(batch, self.scenario, include_task_info=include_task_info))
-            payload = parse_json_response(response) if response else None
-            mutations = extract_batch_mutations(payload) if payload else None
-            if not mutations:
-                result_chromosomes.extend(fallback)
-                continue
-            for i, ind in enumerate(batch):
-                item = mutations[i] if i < len(mutations) else None
-                chrom = item.get("chromosome") if isinstance(item, dict) else None
-                if validate_chromosome(chrom, len(self.scenario.tasks), self.scenario.valid_ot_ids):
-                    result_chromosomes.append([int(v) for v in chrom])
-                else:
-                    result_chromosomes.append(fallback[i])
-        return result_chromosomes
-
 
 class LLMNSGA2Solver:
     """LLM-guided NSGA-II: LLM selects/crosses/mutates; NSGA-II controls Pareto selection."""
@@ -185,28 +173,19 @@ class LLMNSGA2Solver:
                 b = parents[self.rng.randrange(len(parents))]
                 pairs.append((a, b))
 
-            if self.use_llm_crossover:
-                crossed_chromosomes = self.operator.crossover_batch(pairs)
+            mutation_flags = [self.rng.random() < self.mutation_rate for _ in pairs]
+            if self.use_llm_crossover and self.use_llm_mutation:
+                crossed_chromosomes = self.operator.crossover_mutation_batch(pairs, mutation_flags)
             else:
-                crossed_chromosomes = [uniform_crossover(a.chromosome, b.chromosome, self.rng) for a, b in pairs]
-
-            # Apply crossover probability: non-crossover offspring clone parent A.
-            for i, (a, b) in enumerate(pairs):
-                if self.rng.random() >= self.crossover_rate:
-                    crossed_chromosomes[i] = list(a.chromosome)
-
-            mutate_indices = [i for i in range(len(crossed_chromosomes))
-                              if self.rng.random() < self.mutation_rate]
-            if self.use_llm_mutation:
-                mut_inputs = [Individual(crossed_chromosomes[i]) for i in mutate_indices]
-                mutated = self.operator.mutation_batch(mut_inputs)
-                for pos, idx in enumerate(mutate_indices):
-                    crossed_chromosomes[idx] = mutated[pos]
-            else:
-                for idx in mutate_indices:
-                    crossed_chromosomes[idx] = bitwise_mutation(
-                        crossed_chromosomes[idx], scenario.valid_ot_ids, self.rng
-                    )
+                crossed_chromosomes = []
+                for i, (a, b) in enumerate(pairs):
+                    if self.rng.random() < self.crossover_rate:
+                        child = uniform_crossover(a.chromosome, b.chromosome, self.rng)
+                    else:
+                        child = list(a.chromosome)
+                    if mutation_flags[i]:
+                        child = bitwise_mutation(child, scenario.valid_ot_ids, self.rng)
+                    crossed_chromosomes.append(child)
 
             offspring = [
                 evaluate_individual(scenario, chrom, self.decoder, self.evaluator)

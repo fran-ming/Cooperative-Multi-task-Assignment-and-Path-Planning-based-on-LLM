@@ -2,7 +2,7 @@ import random
 
 from data.config import LLM_CONFIG
 from nsga.decoder import Decoder, ObjectiveEvaluator
-from nsga.encoding import Individual, initialize_population, bitwise_mutation
+from nsga.encoding import initialize_population
 from nsga.nsgaii import evaluate_population, evaluate_individual
 from algorithms.llm_nsga import LLMOperator
 from llm.client import LLMClient
@@ -47,18 +47,8 @@ class LLMPureSolver:
                 a = ranked[self.rng.randrange(len(ranked))]
                 b = ranked[self.rng.randrange(len(ranked))]
                 pairs.append((a, b))
-            offspring_chrom = self.operator.crossover_batch(pairs)
-            for i, (a, b) in enumerate(pairs):
-                if self.rng.random() >= self.crossover_rate:
-                    offspring_chrom[i] = list(a.chromosome)
-
-            mutate_indices = [i for i in range(len(offspring_chrom))
-                              if self.rng.random() < self.mutation_rate]
-            if mutate_indices:
-                mut_inputs = [Individual(offspring_chrom[i]) for i in mutate_indices]
-                mutated = self.operator.mutation_batch(mut_inputs)
-                for pos, idx in enumerate(mutate_indices):
-                    offspring_chrom[idx] = mutated[pos]
+            mutation_flags = [self.rng.random() < self.mutation_rate for _ in pairs]
+            offspring_chrom = self.operator.crossover_mutation_batch(pairs, mutation_flags)
 
             offspring = [
                 evaluate_individual(scenario, chrom, self.decoder, self.evaluator)
