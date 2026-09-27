@@ -40,36 +40,47 @@ from MPAGE.config import MPAGE_CONFIG
 
 SAVE_DIR = RESULTS_DIR / "figures" / "pathplanner"
 
-# MPaGE meta-level configuration.  LLM is disabled by default so the experiment
-# runs deterministically without an API dependency (guide section 43); set the
-# environment variable MPAGE_ENABLE_LLM=1 to enable LLM-driven heuristic
-# reflection / mutation / crossover.
-EXPERIMENT_MPAGE_CONFIG = dict(MPAGE_CONFIG)
-EXPERIMENT_MPAGE_CONFIG.update({
-    "enable_llm": os.getenv("MPAGE_ENABLE_LLM", "0") == "1",
-    "heuristic_population_size": 6,
-    "meta_generations": 6,
-    "inner_generations": 10,
-    "inner_population_size": 40,
-    "elite_heuristics": 4,
-    "grid_bins": 5,
-    "semantic_clusters": 3,
-    "mutation_probability": 0.8,
-    "crossover_probability": 0.7,
-    "heuristic_seed_ratio": 0.3,
-    "seed": 42,
-})
+# MPaGE meta-level configuration. This script exposes an explicit LLM switch so
+# the experiment can be run in either mode without relying on the environment
+# default. Default is LLM-enabled to match the intended experiment run.
+def _resolve_enable_llm(use_llm=True):
+    if use_llm is not None:
+        return bool(use_llm)
+    env_value = os.getenv("MPAGE_ENABLE_LLM", "1")
+    return str(env_value).strip().lower() not in {"0", "false", "no", "off"}
 
 
-def run_mpage(scenario, seed=42):
+def build_experiment_mpage_config(use_llm=None):
+    config = dict(MPAGE_CONFIG)
+    config.update({
+        "enable_llm": _resolve_enable_llm(use_llm),
+        "heuristic_population_size": 6,
+        "meta_generations": 6,
+        "inner_generations": 10,
+        "inner_population_size": 40,
+        "elite_heuristics": 4,
+        "grid_bins": 5,
+        "semantic_clusters": 3,
+        "mutation_probability": 0.8,
+        "crossover_probability": 0.7,
+        "heuristic_seed_ratio": 0.3,
+        "seed": 42,
+    })
+    return config
+
+#修改调用
+EXPERIMENT_MPAGE_CONFIG = build_experiment_mpage_config(use_llm=True)
+
+
+def run_mpage(scenario, seed=42, use_llm=True):
     """Run the MPaGE meta-level solver and return its best CMAPP solution."""
-    solver = MPAGESolver(config=EXPERIMENT_MPAGE_CONFIG, seed=seed)
+    config = build_experiment_mpage_config(use_llm=use_llm)
+    solver = MPAGESolver(config=config, seed=seed)
     result = solver.solve(scenario)
     best = result["best_solution"]
     history = result["history"]
     stats = solver.get_stats()
-    model_name = ("MPaGE-CMAPP" if not EXPERIMENT_MPAGE_CONFIG["enable_llm"]
-                  else "MPaGE-CMAPP (LLM)")
+    model_name = ("MPaGE-CMAPP" if not config["enable_llm"] else "MPaGE-CMAPP (LLM)")
     return best, history, stats, model_name
 
 
@@ -354,7 +365,7 @@ def write_schedule_csv(scenario, best, output_dir):
     path = output_dir / "mpage_schedule_10task.csv"
     pd.DataFrame(rows).to_csv(path, index=False, encoding="utf-8-sig")
     print("Saved schedule CSV: %s" % path)
-def main():
+def main(use_llm=True):
     output_dir = SAVE_DIR
     output_dir.mkdir(parents=True, exist_ok=True)
     # Use decoder's predefined task/OT positions and VUT key nodes.  The
@@ -363,11 +374,11 @@ def main():
     # 2).  Kept at 14 tasks to stay consistent with the OR-Tools/LLM-NSGA
     # comparison rows already recorded in *_single_run_14.csv.
     #修改协作参数
-    print("Building 14-task cooperative CMAPP scenario from decoder defaults...")
+    print(f"Building 14-task cooperative CMAPP scenario from decoder defaults... [LLM enabled={bool(use_llm)}]")
     scenario = build_cooperative_scenario(num_tasks=14, seed=42)
     print("Running MPaGE-CMAPP...")
     start = time.time()
-    best, history, stats, model_name = run_mpage(scenario, seed=42)
+    best, history, stats, model_name = run_mpage(scenario, seed=42, use_llm=use_llm)
     runtime = time.time() - start
     print("MPaGE-CMAPP objectives [Jd,Jm,Jb,Jt]:", best.objectives)
     print("MPaGE-CMAPP stats:", stats)
@@ -430,4 +441,15 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Run the MPaGE 14-task cooperative path-planning experiment.")
+    parser.add_argument("--llm", dest="use_llm", action="store_true", default=None,
+                        help="Force LLM-enabled MPaGE mode.")
+    parser.add_argument("--no-llm", dest="use_llm", action="store_false",
+                        help="Disable LLM-assisted heuristic evolution.")
+    args = parser.parse_args()
+
+    # Default to LLM-enabled mode unless the caller explicitly opts out.
+    use_llm = _resolve_enable_llm(args.use_llm)
+    main(use_llm=use_llm)

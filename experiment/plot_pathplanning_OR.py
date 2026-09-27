@@ -853,7 +853,7 @@ def main():
     #修改任务参数
     if use_cooperative:
         print("Building 14-task cooperative CMAPP scenario from decoder defaults...")
-        scenario = build_cooperative_scenario(num_tasks=15, seed=42)
+        scenario = build_cooperative_scenario(num_tasks=14, seed=42)
     else:
         print("Building 10-task CMAPP scenario from decoder defaults...")
         scenario = build_standard_scenario(num_tasks=10, seed=42)
